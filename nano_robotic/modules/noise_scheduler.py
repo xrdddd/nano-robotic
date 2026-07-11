@@ -1,29 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from vla_foundry.params.model_params import NoiseSchedulerParams
-
-
-class NoiseScheduler:
-    def __init__(self, params: NoiseSchedulerParams):
-        pass
-
-    def add_noise(self, x_start, noise, timesteps):
-        raise NotImplementedError
-
-    def step(self, model_output, timestep, sample):
-        raise NotImplementedError
+from typing import Any
 
 
-class NoiseSchedulerDDPM(nn.Module, NoiseScheduler):
-    def __init__(self, params: NoiseSchedulerParams):
+class NoiseSchedulerDDPM(nn.Module):
+    def __init__(self, params: dict[str, Any]):
         nn.Module.__init__(self)
-        NoiseScheduler.__init__(self, params)
-        self.num_timesteps = params.num_timesteps
-        self.beta_start = params.beta_start
-        self.beta_end = params.beta_end
-        self.clamp_range = params.clamp_range
+        self.num_timesteps = params['num_timesteps']
+        self.beta_start = params['beta_start']
+        self.beta_end = params['beta_end']
+        self.clamp_range = params['clamp_range']
         betas = torch.linspace(self.beta_start, self.beta_end, self.num_timesteps)
         alphas = 1 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)

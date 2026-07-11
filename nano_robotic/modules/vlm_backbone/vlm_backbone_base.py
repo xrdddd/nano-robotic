@@ -4,29 +4,26 @@ from abc import abstractmethod
 from typing import Any
 
 import torch
-from transformers.utils import ModelOutput
-from typing import Protocol
+import torch.nn as nn
 
-from vla_foundry.models.base_model import BaseModel
-from vla_foundry.models.model_outputs.backbone_output import VisionLanguageBackboneOutput
-from vla_foundry.models.registry import create_model
-from vla_foundry.params.model_params import BackboneParams
-
-
-class VLMBackBone(Protocol):
+class VLMBackBoneBase(nn.Module):
     """Base wrapper that adapts a vision-language model for action policy conditioning.
 
     Subclasses create the underlying model internally and implement
     extraction of conditioning embeddings from model outputs.
     """
 
-    def __init__(self, backbone_params: BackboneParams, load_pretrained: bool = True):
-        super().__init__(backbone_params)
-        self._model = create_model(backbone_params, load_pretrained)
+    def __init__(self):
+        super().__init__()
+        self._model = self.create_model()
 
     @abstractmethod
     def get_conditioning_embeddings_dim(self) -> int:
         """Get the output conditioning embeddings dimension."""
+        raise NotImplementedError
+    
+    @abstractmethod
+    def create_model(self) -> nn.Module:
         raise NotImplementedError
 
     def get_action_conditioning(
@@ -36,7 +33,7 @@ class VLMBackBone(Protocol):
         attention_mask: torch.Tensor | None = None,
         attention_mask_images: torch.Tensor | None = None,
         **kwargs,
-    ) -> VisionLanguageBackboneOutput:
+    ) -> torch.Tensor:
         """Get embeddings for conditioning action policies.
 
         Args:
@@ -65,7 +62,7 @@ class VLMBackBone(Protocol):
             **model_kwargs,
         )
 
-        return self._extract_action_conditioning(outputs=outputs)
+        return self._extract_action_conditioning(model_output=outputs)
 
     def _prepare_inputs(
         self,
@@ -85,6 +82,6 @@ class VLMBackBone(Protocol):
         return input_ids, pixel_values, attention_mask, attention_mask_images, kwargs
 
     @abstractmethod
-    def _extract_action_conditioning(self, outputs: ModelOutput) -> VisionLanguageBackboneOutput:
+    def _extract_action_conditioning(self, model_output:dict) -> torch.Tensor:
         """Extract conditioning embeddings from model outputs."""
         raise NotImplementedError

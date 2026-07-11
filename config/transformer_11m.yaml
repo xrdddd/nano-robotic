@@ -1,0 +1,17 @@
+hidden_dim: 96
+n_layers: 8
+n_heads: 4
+max_seq_len: 2048
+vocab_size: 50432
+post_embed_norm: false
+weight_tying: false
+is_causal: false
+resume_weights_only: false
+freeze: false
+norm_type: "default_layer_norm"
+ffn_type: "swiglu"
+qk_norm: false
+positional_embedding_type: "rotary"
+attn_name: "torch_attn"
+norm_eps: 1.0e-05
+cast_output_to_float32: false

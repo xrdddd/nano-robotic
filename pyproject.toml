@@ -106,7 +106,7 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["nano-robotic*"]
+include = ["nano_robotic*"]
 exclude = ["install*", "sagemaker*", "examples*"]
 
 [tool.uv.sources]

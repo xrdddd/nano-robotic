@@ -1,41 +1,43 @@
 import torch
 
 import torch.nn as nn
-from nano_robotic.modules.noise_scheduler import NoiseScheduler
+from typing import Any
+from nano_robotic.utils.noise_scheduler import FlowMatchingScheduler
 from nano_robotic.modules.sin_pos_emb import SinusoidalPositionEmbeddings
 from nano_robotic.modules.transformer import Transformer
-# from nano_robotic.models.transformer_hf import TransformerHF
-from nano_robotic.modules.vlm_backbone_interface import VLMBackBone
-from nano_robotic.model_params import VLAParams
+from nano_robotic.modules.vlm_backbone.vlm_backbone_smolvlm import VLMHFBackboneWrapper
+from nano_robotic.modules.vlm_backbone.vlm_backbone_base import VLMBackBoneBase
+from nano_robotic.utils.file_utils import yaml_load
 
+def get_vision_language_backbone() -> VLMBackBoneBase:
+    return VLMHFBackboneWrapper()
 
 class VLA(nn.Module):
     def __init__(
         self,
-        model_params: VLAParams,
-        vision_language_backbone: VLMBackBone,
-        transformer: Transformer,
-        noise_scheduler: NoiseScheduler,
+        action_params: dict[str, Any],
     ):
         super().__init__()
-        self.vision_language_backbone = vision_language_backbone
-        self.transformer = transformer
-        self.scheduler = noise_scheduler
-        self.proprioception_dim = model_params.proprioception_dim
+        
+        self.vision_language_backbone = get_vision_language_backbone()
+        cfg = yaml_load("config/transformer_11m.yaml")
+        self.transformer = Transformer(cfg)
+        self.scheduler = FlowMatchingScheduler()
+        self.proprioception_dim = action_params["proprioception_dim"]
 
-        backbone_dim = vision_language_backbone.get_conditioning_embeddings_dim()
-        self.time_encoding = torch.nn.Embedding(noise_scheduler.num_timesteps, backbone_dim)
+        backbone_dim = self.vision_language_backbone.get_conditioning_embeddings_dim()
+        self.time_encoding = torch.nn.Embedding(self.scheduler.num_timesteps, backbone_dim)
         self.sinusoidal_position_embeddings = SinusoidalPositionEmbeddings(backbone_dim)
-        self.output_layer = torch.nn.Linear(transformer.hidden_dim, model_params.action_dim)
-        self.action_encode = torch.nn.Linear(model_params.action_dim, transformer.hidden_dim)
-        self.condition_encode = torch.nn.Linear(backbone_dim, transformer.hidden_dim)
+        self.output_layer = torch.nn.Linear(self.transformer.hidden_dim, action_params["action_dim"])
+        self.action_encode = torch.nn.Linear(action_params["action_dim"], self.transformer.hidden_dim)
+        self.condition_encode = torch.nn.Linear(backbone_dim, self.transformer.hidden_dim)
         self.proprioception_encode = (
-            torch.nn.Linear(self.proprioception_dim, transformer.hidden_dim) if self.proprioception_dim > 0 else None
+            torch.nn.Linear(self.proprioception_dim, self.transformer.hidden_dim) if self.proprioception_dim > 0 else None
         )
 
-        self.diffusion_step_conditioning = model_params.diffusion_step_conditioning
-        self.input_noise_std = model_params.input_noise_std
-        self.num_action_head_repeats = model_params.num_action_head_repeats
+        self.diffusion_step_conditioning = action_params["diffusion_step_conditioning"]
+        self.input_noise_std = action_params["input_noise_std"]
+        self.num_action_head_repeats = action_params["num_action_head_repeats"]
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -105,7 +107,7 @@ class VLA(nn.Module):
         noisy_action = self.action_encode(noisy_action)
 
         # Get backbone embeddings (handles text+image concatenation)
-        backbone_output = self.vision_language_backbone.get_action_conditioning(
+        backbone_output_embeddings = self.vision_language_backbone.get_action_conditioning(
             input_ids=input_ids,
             pixel_values=pixel_values,
             attention_mask=attention_mask,
@@ -113,7 +115,7 @@ class VLA(nn.Module):
             **kwargs,
         )
 
-        backbone_embeddings = backbone_output.embeddings
+        backbone_embeddings = backbone_output_embeddings
         num_repeats = self.num_action_head_repeats
         if num_repeats is not None and num_repeats > 1:
             # Verify action-side inputs were tiled to [B*N] by the batch handler
@@ -162,7 +164,7 @@ class VLA(nn.Module):
 
         # Extract predicted direction to denoise the action (B, 1+N+P+T, D) -> (B, T, D)
         action_seq_len = noise.shape[1]
-        predicted_direction = self.output_layer(transformer_output.hidden_states[-1][:, -action_seq_len:, :])
+        predicted_direction = self.output_layer(transformer_output[-1][:, -action_seq_len:, :])
 
         return predicted_direction
 

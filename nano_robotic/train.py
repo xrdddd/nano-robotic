@@ -10,280 +10,99 @@ Notes
 delegated to subpackages (data, models, opt, train, etc.).
 """
 
-import json
 import logging
-import os
-import uuid
-
-import draccus
 import torch
-import yaml
+import argparse
 
-from nano-robotic.data.dataloader import get_datastring_input, get_wds_dataloader
-from nano-robotic.data.utils import load_data_chunks
-from nano-robotic.distributed import get_model_precision, is_master, move_buffers_to_device, wrap_fsdp_ddp
-from nano-robotic.file_utils import (
-    collect_preprocessing_configs,
-    collect_processing_metadata,
-    file_exists,
-    load_ema_checkpoint,
-    load_model_checkpoint,
-    remote_sync,
-    save_checkpoint,
-)
-from nano-robotic.logger import setup_logging
-from nano-robotic.losses import get_loss_function
-from nano-robotic.models import create_model
-from nano-robotic.models.ema import create_ema_model
-from nano-robotic.optimizer import create_optimizer, load_optimizer
-from nano-robotic.params.train_experiment_params import TrainExperimentParams
-from nano-robotic.scheduler import create_scheduler
-from nano-robotic.train import train_one_checkpoint
-from nano-robotic.utils import get_experiment_name, set_random_seed, summarize_datastrings
-from nano-robotic.validate import validate_one_checkpoint
+import itertools
+import logging
+import time
+from collections.abc import Callable
+from torch.optim.optimizer import Optimizer
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+
+from nano_robotic.modules.vla import VLA
+
+from nano_robotic.data.dataloader import get_datastring_input, get_dataloader
+from nano_robotic.utils.optimizer import create_optimizer
+from nano_robotic.utils.lr_scheduler import lr_scheduler
+from nano_robotic.utils.loss_function import masked_mse_loss
+from nano_robotic.utils.utils import set_random_seed, summarize_datastrings, load_yaml, count_parameters, print0, world_info_from_env
+from nano_robotic.batch_handlers import DiffusionPolicyBatchHandler
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Pretrain base model")    
+    
+    # training dataset
+    parser.add_argument("--camera_names", type=str, default="['exterior_image_1_left','exterior_image_2_left','wrist_image_left']", help="")
+    parser.add_argument("--action_fields", type=str, default="['action']", help="")
+    parser.add_argument("--proprioception_fields", type=str, default="['observation.state']", help="")
+    parser.add_argument("--lowdim_past_timesteps", type=int, default=2, help="")
+    parser.add_argument("--lowdim_future_timesteps", type=int, default=14, help="")
+    
+    parser.add_argument("--total_train_samples", type=int, default=128, help="")    
+    parser.add_argument("--global_batch_size", type=int, default=1, help="")     
+    parser.add_argument("--per_gpu_batch_size", type=int, default=1, help="")     
+    
+    # cpu loading dataset
+    parser.add_argument("--num_workers", type=int, default=1, help="")
+    
+    # optimizer
+    parser.add_argument("--optimizer", type=str, default="adamw", help="")            
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="")            
+    parser.add_argument("--lr", type=float, default=0.0005, help="")            
+    parser.add_argument("--beta1", type=float, default=0.9, help="")            
+    parser.add_argument("--beta2", type=float, default=0.95, help="")            
+    parser.add_argument("--eps", type=float, default=1e-08, help="")            
+    
+    parser.add_argument("--seed", type=int, default=42, help="")  
+    parser.add_argument("--num_checkpoints", type=int, default=2, help="")  
+    parser.add_argument("--dataset_manifest", type=str, default="data/droid_100_minimal/preprocessed/shards/manifest.jsonl", help="") 
+    
+    
+    args = parser.parse_args()
+    
+    return args
 
 
 def main():
-    """
-    Entry point for launching training.
+    cfg = parse_args()
 
-    Arguments are parsed with draccus.parse to instantiate a TrainExperimentParams object.
-    They are provided as a preset yaml file, or as command line arguments or both.
-    When using both a preset yaml file and command line arguments, the command line arguments take precedence.
-    The preset yaml file is loaded with draccus.load, which supports !include statements to link a sub-preset yaml file.
-    Other sub-preset yaml files can be passed as command line arguments with '--arg.subarg "include <path>"'.
-
-    This function orchestrates experiment directory setup, (distributed) model
-    construction, optimizer/scheduler creation, dataset selection per
-    checkpoint, the training loop, and periodic checkpointing + remote sync.
-
-    See README.md for more details.
-    """
-    # Parse config.
-    cfg = draccus.parse(config_class=TrainExperimentParams)
-    
-    # check config
-    check_cfg(cfg)
-    
-    if cfg.resolve_configs:
-        # Resolve configs for debugging. Program stops here if the flag is received.
-        if is_master(cfg):
-            print("Resolved config: ", cfg)
-            if cfg.resolve_configs_path is not None:
-                with open(os.path.join(cfg.resolve_configs_path, "resolved_config.yaml"), "w") as f:
-                    draccus.dump(cfg, f)
-                print(f"The resolved config was saved to {cfg.resolve_configs_path.rstrip('/')}/resolved_config.yaml")
-            print(
-                "=" * 50 + "\nThe flag --resolve_configs was received, stopping here. "
-                "If the configuration is the one you want to launch, re-run without that flag."
-            )
-        return
-
-    device = cfg.distributed.device
+    device = 'cpu'
     # Seed rank-0 before any object creation for reproducibility.
-    set_random_seed(cfg.hparams.seed, 0)
+    set_random_seed(cfg.seed, 0)
 
-    # Early validation: check checkpoint path exists if provided
-    if cfg.model.resume_from_checkpoint is not None:
-        if not file_exists(cfg.model.resume_from_checkpoint):
-            raise FileNotFoundError(
-                f"Checkpoint not found at '{cfg.model.resume_from_checkpoint}'. "
-                "Please verify the path is correct and accessible."
-            )
-        else:
-            logging.info(
-                f"Checkpoint validation passed. Will load weights from '{cfg.model.resume_from_checkpoint}' for "
-                f"{'finetuning' if cfg.model.resume_weights_only else 'resuming training'}."
-            )
-
-    # Set path for experiment, log, checkpoints.
-    experiment_name = get_experiment_name(cfg)
-    experiment_uuid = str(uuid.uuid4())
-
-    if cfg.save_path is None:
-        experiment_path = os.path.join("experiments", experiment_name)
-    else:
-        experiment_path = os.path.join(cfg.save_path, experiment_name)
-    os.makedirs(experiment_path, exist_ok=True)
-    log_path = os.path.join(experiment_path, "out.log")
-    # Convert string log level to logging constant
-    log_level = getattr(logging, cfg.log_level.upper(), logging.INFO)
-    setup_logging(log_path, log_level)
-    checkpoint_path = os.path.join(experiment_path, "checkpoints")
-    os.makedirs(checkpoint_path, exist_ok=True)
-
-    if is_master(cfg):
-        # Persist the resolved config.
-        with open(os.path.join(experiment_path, "config.yaml"), "w") as f:
-            draccus.dump(cfg, f)
-        with open(os.path.join(experiment_path, "config_model.yaml"), "w") as f:
-            draccus.dump(cfg.model, f)
-
-        # Collect and save processing metadata and configs from all data sources
-        processing_metadata = collect_processing_metadata(cfg.data.dataset_manifest, experiment_path)
-        if processing_metadata:
-            with open(os.path.join(experiment_path, "processing_metadata.json"), "w") as f:
-                json.dump(processing_metadata, f, indent=2)
-        preprocessing_configs = collect_preprocessing_configs(cfg.data.dataset_manifest)
-        if preprocessing_configs:
-            with open(os.path.join(experiment_path, "preprocessing_config.yaml"), "w") as f:
-                yaml.dump(preprocessing_configs, f)
-
-        # Initial sync to check that remote_sync works.
-        if cfg.remote_sync:
-            remote_sync(experiment_path, os.path.join(cfg.remote_sync, experiment_name))
-            remote_sync(experiment_path, os.path.join(cfg.remote_sync_fixed_path, experiment_uuid))
-
-    if cfg.distributed.use_distributed:
-        logging.info(
-            f"Running in distributed mode with multiple processes. Device: {cfg.distributed.device}."
-            f"Process (global: {cfg.distributed.rank}, local {cfg.distributed.local_rank}), "
-            f"total {cfg.distributed.world_size}."
-        )
-    else:
-        logging.info(f"Running with a single process. Device {cfg.distributed.device}.")
-
-    # Model construction
-    model = create_model(cfg.model)
-    # Re-seed with rank to randomize across workers.
-    set_random_seed(cfg.hparams.seed, cfg.distributed.rank)
-    if cfg.hparams.grad_checkpointing:
-        model.set_grad_checkpointing()
-
-    # Create EMA model if enabled (BEFORE FSDP wrapping to avoid deepcopy issues)
-    ema_model = None
-    if cfg.ema.enabled:
-        # Prepare kwargs based on EMA type
-        if cfg.ema.type == "vanilla":
-            ema_kwargs = {"alpha": cfg.ema.alpha}
-        else:  # "ema" (adaptive)
-            ema_kwargs = {
-                "update_after_step": cfg.ema.update_after_step,
-                "inv_gamma": cfg.ema.inv_gamma,
-                "power": cfg.ema.power,
-                "min_value": cfg.ema.min_value,
-                "max_value": cfg.ema.max_value,
-            }
-
-        ema_model = create_ema_model(model, ema_type=cfg.ema.type, **ema_kwargs)
-
-        # Move EMA model to device in FP32 (BF16 causes precision issues with high decay values)
-        # EMA needs FP32 because decay values like 0.9999 round to 1.0 in BF16, stopping all updates
-        ema_model = ema_model.to(device, dtype=torch.float32)
-
-        if cfg.ema.type == "vanilla":
-            logging.info(f"Created Vanilla EMA model with alpha={cfg.ema.alpha}")
-        else:
-            logging.info(
-                f"Created Adaptive EMA model with power={cfg.ema.power}, inv_gamma={cfg.ema.inv_gamma}, "
-                f"max_value={cfg.ema.max_value}"
-            )
-
-    # Wrap for distributed or move to device with the configured precision.
-    if cfg.distributed.use_distributed:
-        model = wrap_fsdp_ddp(model, device, cfg)
-    else:
-        model = model.to(device, dtype=get_model_precision(cfg))
+    model_cfg = load_yaml("config/vla.yaml")
+    model = VLA(model_cfg)
+    model = model.to(device)
 
     # Optionally resume model from a checkpoint or finetune from pretrained weights.
     start_checkpoint_num, global_step = 0, 0
-    total_steps = cfg.total_train_samples // cfg.hparams.global_batch_size
+    total_steps = cfg.total_train_samples // cfg.global_batch_size
     shard_shuffle_seed_per_dataset = None
-    if cfg.model.resume_from_checkpoint is not None:
-        if cfg.model.resume_weights_only:
-            logging.info(f"Finetuning: Loading pretrained weights from '{cfg.model.resume_from_checkpoint}'")
-            load_model_checkpoint(model, cfg.model.resume_from_checkpoint)
-        else:
-            start_checkpoint_num, global_step, shard_shuffle_seed_per_dataset = load_model_checkpoint(
-                model, cfg.model.resume_from_checkpoint
-            )
-
     # Create optimizer before torchcompile
-    optimizer = create_optimizer(cfg.hparams, model)
-
-    if cfg.hparams.torchcompile:
-        # Ensure all buffers are on the correct device before compiling.
-        # Some HuggingFace models (like SigLIP) have buffers that stay on CPU
-        # which causes device mismatch errors during compilation.
-        move_buffers_to_device(model, device)
-        logging.info("Compiling model with torch.compile()...")
-        # Note: torch.compile compatibility can vary across VLMs; some configurations may not compile cleanly.
-        model = torch.compile(model)
-
-    def count_parameters(model):
-        total = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total parameters: {total:,}")
-        print(f"Trainable parameters: {trainable:,}")
-
+    optimizer = create_optimizer(cfg, model)
     count_parameters(model)
-
-    # Optionally resume optimizer state from a checkpoint.
-    # This needs to be after torchcompile.
-    if cfg.model.resume_from_checkpoint is not None and not cfg.model.resume_weights_only:
-        load_optimizer(optimizer, checkpoint_path=cfg.model.resume_from_checkpoint, use_fsdp=cfg.distributed.fsdp)
-
-        # Load EMA checkpoint if EMA is enabled and checkpoint exists
-        if ema_model is not None:
-            # Construct EMA checkpoint path from model checkpoint path
-            checkpoint_dir = os.path.dirname(cfg.model.resume_from_checkpoint)
-            checkpoint_file = os.path.basename(cfg.model.resume_from_checkpoint)
-            # Replace "checkpoint_" with "ema_" to get EMA checkpoint path
-            ema_checkpoint_file = checkpoint_file.replace("checkpoint_", "ema_")
-            ema_checkpoint_path = os.path.join(checkpoint_dir, ema_checkpoint_file)
-            load_ema_checkpoint(ema_model, ema_checkpoint_path)
-
     # Create LR scheduler, loss function.
-    scheduler = create_scheduler(cfg.hparams, optimizer, cfg.total_train_samples)
-    loss = get_loss_function(cfg.hparams.loss_function, cfg.hparams)
-
-    # Logging.
-    if cfg.wandb and is_master(cfg):
-        import wandb  # imported lazily to avoid hard dependency when disabled
-
-        logging.debug("Starting wandb.")
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=cfg.wandb_project_name,
-            name=experiment_name,
-            tags=cfg.wandb_tags,
-            resume=None,
-            config=vars(cfg),
-        )
-        logging.debug("Wandb initialized.")
+    scheduler = lr_scheduler
+    loss = masked_mse_loss
 
     done_training = global_step >= total_steps
     checkpoint_num = start_checkpoint_num
     # Per-dataset cursors and shuffle seeds allow resuming mixed datasets.
-    curr_shard_idx_per_dataset = [0 for dataset in range(len(cfg.data.dataset_manifest))]
+    curr_shard_idx_per_dataset = 0
     if shard_shuffle_seed_per_dataset is None:
-        shard_shuffle_seed_per_dataset = [cfg.hparams.seed for dataset in range(len(cfg.data.dataset_manifest))]
-
+        shard_shuffle_seed_per_dataset = cfg.seed
     samples_seen = 0
-    if cfg.model.resume_from_checkpoint is not None and not cfg.model.resume_weights_only:
-        # Also restore which shards were consumed and how many samples were seen.
-        curr_shard_idx_per_dataset, samples_seen = load_data_chunks(cfg.model.resume_from_checkpoint)
-
-    # Load validation dataloader once here to reuse across checkpoints.
-    do_validation = cfg.total_val_samples is not None
-    if do_validation:
-        val_datastrings, val_num_samples_per_dataset, _, _ = get_datastring_input(
-            num_samples=cfg.total_val_samples,
-            curr_shard_idx_per_dataset=[0 for _ in cfg.data.val_dataset_manifest],
-            shard_shuffle_seed_per_dataset=[cfg.hparams.seed for _ in cfg.data.val_dataset_manifest],
-            manifest_paths=cfg.data.val_dataset_manifest,
-            dataset_weighting=cfg.data.val_dataset_weighting,
-            allow_multiple_epochs=True,
-            num_workers_per_gpu=cfg.data.num_workers,
-            world_size=cfg.distributed.world_size,
-        )
-        val_dataloader = get_wds_dataloader(val_datastrings, val_num_samples_per_dataset, 0, cfg)
-
+    
+    local_rank, global_rank, world_size = world_info_from_env()
+    
     # Main training loop
     while not done_training:
-        if is_master(cfg):
-            logging.info(f"Start checkpoint {checkpoint_num}")
-
         # Partition the global sample budget into evenly-sized checkpoint chunks.
         samples_per_checkpoint = cfg.total_train_samples // cfg.num_checkpoints
         datastrings, num_samples_per_dataset, curr_shard_idx_per_dataset, shard_shuffle_seed_per_dataset = (
@@ -291,40 +110,19 @@ def main():
                 num_samples=samples_per_checkpoint,
                 curr_shard_idx_per_dataset=curr_shard_idx_per_dataset,
                 shard_shuffle_seed_per_dataset=shard_shuffle_seed_per_dataset,
-                manifest_paths=cfg.data.dataset_manifest,
-                dataset_weighting=cfg.data.dataset_weighting,
-                allow_multiple_epochs=cfg.data.allow_multiple_epochs,
-                num_workers_per_gpu=cfg.data.num_workers,
-                world_size=cfg.distributed.world_size,
+                manifest_path=cfg.dataset_manifest,
+                num_workers_per_gpu=1,
+                world_size=world_size,
             )
         )
 
-        if is_master(cfg):
-            logging.info(f"Now training on: {summarize_datastrings(datastrings)}")
-            logging.info(f"Samples: {samples_seen} / {cfg.total_train_samples}")
-            logging.info(f"Samples in this checkpoint (per dataset): {num_samples_per_dataset}")
+        logging.info(f"Now training on: {summarize_datastrings(datastrings)}")
+        logging.info(f"Samples: {samples_seen} / {cfg.total_train_samples}")
+        logging.info(f"Samples in this checkpoint: {num_samples_per_dataset}")
 
-        # Safety check: ensure all ranks see the same data slice.
-        if cfg.distributed.use_distributed:
-            all_datastrings = ["" for _ in range(cfg.distributed.world_size)]
-            torch.distributed.all_gather_object(all_datastrings, datastrings)
-            assert all([x == datastrings for x in all_datastrings]), (
-                "Dataset to train on is not the same across all nodes. This should not happen normally, "
-                "unless there is an issue with shard shuffling during the dataset generation."
-            )
-
-        dataloader = get_wds_dataloader(datastrings, num_samples_per_dataset, checkpoint_num, cfg)
-        if is_master(cfg):
-            # Save any necessary dataloader/pipeline configs.
-            dataloader.save_configs(experiment_path)
-            if cfg.remote_sync:
-                remote_sync(experiment_path, os.path.join(cfg.remote_sync, experiment_name))
-                remote_sync(experiment_path, os.path.join(cfg.remote_sync_fixed_path, experiment_uuid))
+        dataloader = get_dataloader(datastrings, num_samples_per_dataset, checkpoint_num, world_size, cfg)
 
         prev_step = global_step
-
-        if cfg.distributed.use_distributed:
-            torch.distributed.barrier()
 
         success, global_step = train_one_checkpoint(
             model,
@@ -334,68 +132,196 @@ def main():
             global_step,
             optimizer,
             scheduler,
+            device,
+            world_size,
             cfg,
-            ema_model=ema_model,
         )
-        if cfg.distributed.use_distributed:
-            torch.distributed.barrier()
 
         # Translate newly completed steps into samples.
-        samples_seen = samples_seen + (global_step - prev_step) * cfg.hparams.global_batch_size
+        samples_seen = samples_seen + (global_step - prev_step) * cfg.global_batch_size
         checkpoint_num += 1
         done_training = global_step >= total_steps
 
-        # Persist training state (model/opt/scheduler + data cursors).
-        save_checkpoint(
-            cfg,
-            checkpoint_num,
-            checkpoint_path,
-            cfg.max_checkpoint_limit,
-            model,
-            optimizer,
-            datastrings,
-            curr_shard_idx_per_dataset,
-            samples_seen,
-            global_step,
-            shard_shuffle_seed_per_dataset,
-            ema_model=ema_model,
-        )
-
-        # Validate checkpoint.
-        if do_validation and checkpoint_num % cfg.val_every_n_checkpoints == 0:
-            if cfg.distributed.use_distributed:
-                torch.distributed.barrier()
-            avg_val_loss = validate_one_checkpoint(
-                model, val_dataloader, loss, 0, global_step, cfg
-            )  # checkpoint_num=0 for val for consistent data and seeding
-            if is_master(cfg):
-                logging.info(f"Validation after checkpoint {checkpoint_num}: avg_loss={avg_val_loss:.6f}")
-            if cfg.distributed.use_distributed:
-                torch.distributed.barrier()
-
-        # Optionally push artifacts to remote storage after each checkpoint.
-        if is_master(cfg) and cfg.remote_sync:
-            remote_sync(experiment_path, os.path.join(cfg.remote_sync, experiment_name))
-            remote_sync(experiment_path, os.path.join(cfg.remote_sync_fixed_path, experiment_uuid))
-
-        if cfg.distributed.use_distributed:
-            torch.distributed.barrier()
-
         if done_training:
-            if is_master(cfg):
-                logging.info("Model has seen the desired number of samples. Ending training.")
+            logging.info("Model has seen the desired number of samples. Ending training.")
             break
 
-    if cfg.wandb and is_master(cfg):
-        wandb.finish()
+def train_one_checkpoint(
+    model: nn.Module,
+    dataloader,
+    loss: Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor],
+    checkpoint_num: int,
+    step: int,
+    optimizer: optim.Optimizer,
+    scheduler: Callable[[int, int, Optimizer], None],
+    device,
+    world_size,
+    cfg,
+) -> tuple[bool, int]:
+    """
+    Trains model for one checkpoint on the provided data.
 
-    if cfg.distributed.use_distributed and torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    This function:
+      - Drives LR scheduling.
+      - Performs forward/backward/step with optional gradient accumulation.
+      - Computes and (optionally) all-reduces loss across ranks for logging.
+      - Tracks timing/throughput metrics and logs periodically.
+      - Exits when either:
+          * the global training budget in samples is exhausted, or
+          * the dataloader is depleted on any rank.
 
-def check_cfg(cfg : TrainExperimentParams):
-    if cfg.model.type == "vlm":
-        assert cfg.data.img_num_tokens == (cfg.model.vit.img_size // cfg.model.vit.patch_size) ** 2, "parameter img_num_tokens is expected to be equal to the patches count."
-    # other like warning also can go here
+    Args:
+        model: torch.nn.Module or a distributed-wrapped module.
+        dataloader: dataloader object.
+        loss: Callable loss function mapping (logits, targets, mask) -> scalar loss.
+        checkpoint_num: Index of the current checkpoint window (for logs).
+        step: Current global training step **before** this window starts.
+        optimizer: torch.optim.Optimizer instance.
+        scheduler: Callable taking `step` and adjusting LR, etc.
+        cfg: Training config.
+        ema_model: Optional EMA model for maintaining exponential moving average of weights.
+
+    Returns:
+        success (bool): Whether training completed successfully
+        step (int): Global step at the end of the checkpoint.
+    """
+
+    # Create batch handler for the model type
+    batch_handler = DiffusionPolicyBatchHandler()
+
+    model.train()
+
+    # Let the dataloader know which window/checkpoint it's on.
+    dataloader.set_checkpoint_num(checkpoint_num)
+    num_batches_per_checkpoint = dataloader.dataloader.num_batches
+
+    end = time.time()
+    data_iterator = iter(dataloader.dataloader)
+
+    # Progress bar setup - show step progress with proper starting value
+    total_steps = cfg.total_train_samples // cfg.global_batch_size
+    progress_bar = tqdm(
+        initial=step, total=total_steps, desc=f"Checkpoint {checkpoint_num}", disable=False, unit="step"
+    )
+
+    # Open-ended loop; we break on budget or data exhaustion.
+    for i in itertools.count():
+        scheduler(step, total_steps, optimizer)
+
+        # Hard-stop when we reach the sample budget translated into steps.
+        if step >= total_steps:
+            logging.warning(f"step: {step} has reached/exceeded total_steps: {total_steps}. ending training.")
+            break
+
+        # Try to fetch the next batch on this rank.
+        try:
+            batch = next(data_iterator)
+            has_data = torch.tensor(1, dtype=torch.long, device=device)
+        except StopIteration:
+            has_data = torch.tensor(0, dtype=torch.long, device=device)
+
+
+        data_time = time.time() - end
+        optimizer.zero_grad()
+
+        # Prepare model inputs and targets (including chunking) using batch handler
+        model_inputs, targets, mask = batch_handler.prepare_inputs_and_targets(batch, device, cfg)
+
+        # Validate that mask and future_mask are mutually exclusive
+        if mask is not None and "future_mask" in model_inputs:
+            raise ValueError(
+                "mask and future_mask should not both be present. "
+                "Use mask for LLM/VLM or future_mask for diffusion policy, not both."
+            )
+
+        forward_total_time = 0
+        backward_total_time = 0
+        total_lm_loss = 0
+        assert 0 == cfg.global_batch_size % (world_size * cfg.per_gpu_batch_size)
+        accum_freq = cfg.global_batch_size // (world_size * cfg.per_gpu_batch_size)
+        for ii in range(accum_freq):
+
+            with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
+                forward_start = time.time()
+                # Slice the microbatch for this accumulation step.
+                start_idx = ii * cfg.per_gpu_batch_size
+                end_idx = (ii + 1) * cfg.per_gpu_batch_size
+                model_inputs_ii = batch_handler.slice_inputs_for_accumulation(model_inputs, start_idx, end_idx)
+
+                if model_inputs_ii["input_ids"].shape[0] == 0:
+                    break
+
+                targets_ii = batch_handler.slice_targets_for_accumulation(
+                    targets, start_idx, end_idx, sliced_inputs=model_inputs_ii
+                )
+                # Get mask for microbatch: use mask if present, otherwise use future_mask (diffusion policy)
+                mask_ii = mask[start_idx:end_idx] if mask is not None else model_inputs_ii.get("future_mask", None)
+
+                # Forward pass - same for all model types!
+                outputs = model(**model_inputs_ii)
+                forward_total_time += time.time() - forward_start
+
+                local_loss = batch_handler.compute_loss(outputs, targets_ii, loss, cfg, mask=mask_ii)
+
+                # Scale loss by microbatch size ratio
+                local_loss = local_loss * (model_inputs_ii["input_ids"].shape[0] / model_inputs["input_ids"].shape[0])
+
+            # Backward per microbatch.
+            backward_start = time.time()
+            local_loss.backward()
+            backward_total_time += time.time() - backward_start
+            total_lm_loss += local_loss
+
+
+        total_loss = total_lm_loss
+
+        # Optimizer step
+        optim_step_start = time.time()
+        # (Optional) grad clipping
+        # if cfg.grad_clip_norm is not None:
+        #     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm, norm_type=2.0)
+        optimizer.step()
+        optim_step_time = time.time() - optim_step_start
+
+        # Update timing meters for this iteration.
+        batch_time = time.time() - end
+        end = time.time()
+
+        batch_count = i + 1
+        step += 1  # Advance the global step after completing this batch.
+
+        # Master-only logging & W&B
+        batch_size = len(model_inputs["input_ids"])
+        # update the loss meter with the global loss tensor every iteration,
+        # so that the logging is of the avg of loss of the last cfg.log_every_n_steps iterations
+        loss = global_loss_tensor.item() #be carefull item() is a CPU-GPU sync point
+
+        # if (
+        #     (i % cfg.log_every_n_steps == 0 and i > 0)
+        #     or batch_count == num_batches_per_checkpoint
+        #     or step == total_steps - 1
+        # ):
+                # cfg=cfg,
+                # batch_size=batch_size,
+                # batch_num_tokens=model_inputs["input_ids"].numel(),
+                # batch_count=batch_count,
+                # num_batches_per_checkpoint=num_batches_per_checkpoint,
+                # step=step,
+                # dataloader=dataloader,
+                # lr=optimizer.param_groups[0]["lr"],
+                # checkpoint_num=checkpoint_num,
+            
+
+        # Update progress bar
+        progress_bar.update(1)
+        progress_bar.set_postfix(
+            {"loss": f"{global_loss_tensor.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}"}
+        )
+
+    progress_bar.close()
+
+    return True, step
+
     
 if __name__ == "__main__":
     main()

@@ -3,36 +3,32 @@ import math
 import torch
 from torch import nn
 
-from vla_foundry.activations import get_feed_forward
-from vla_foundry.attention import get_attn_func
-from vla_foundry.models.fsdp_block import FSDPBlock
-from vla_foundry.models.model_outputs.llm_output import TransformerOutput
-from vla_foundry.models.registry import register_model
-from vla_foundry.models.transformer_base import TransformerBase
-from vla_foundry.norms import get_norm_class
-from vla_foundry.params.model_params import TransformerParams
-from vla_foundry.positional_embedding import get_pos_embed
+from nano_robotic.modules.feedforward import get_feed_forward
+from nano_robotic.utils.positional_embedding import RotaryWithCast
+from typing import Any
+from torch.nn import functional as F
+
 
 
 class CustomAttn(nn.Module):
-    def __init__(self, layer_id: int, model_params: TransformerParams):
+    def __init__(self, layer_id: int, model_params: dict[str, Any]):
         super().__init__()
-        self.n_heads = model_params.n_heads
-        self.hidden_dim = model_params.hidden_dim
-        self.head_dim = model_params.hidden_dim // model_params.n_heads
+        self.n_heads = model_params['n_heads']
+        self.hidden_dim = model_params['hidden_dim']
+        self.head_dim = model_params['hidden_dim'] // model_params['n_heads']
         self.in_proj = nn.Linear(self.hidden_dim, 3 * self.n_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(self.n_heads * self.head_dim, self.hidden_dim, bias=False)
-        self.pos_embed = get_pos_embed(model_params)
-        self.attn_fn = get_attn_func(model_params.attn_name)
-        self.apply_qk_norm = model_params.qk_norm
-        self.is_causal = model_params.is_causal
+        self.pos_embed = RotaryWithCast(model_params['hidden_dim'] // model_params['n_heads'], model_params['max_seq_len'])
+        self.attn_fn = torch_attn
+        self.apply_qk_norm = model_params['qk_norm']
+        self.is_causal = model_params['is_causal']
 
         # initialize norm layers for queries and keys if needed
-        self.norm_type = get_norm_class(model_params.norm_type)
+        self.norm_type = torch.nn.LayerNorm
         self.q_norm = (
             self.norm_type(
                 self.n_heads * self.head_dim,
-                eps=model_params.norm_eps,
+                eps=model_params['norm_eps'],
             )
             if self.apply_qk_norm
             else nn.Identity()
@@ -40,7 +36,7 @@ class CustomAttn(nn.Module):
         self.k_norm = (
             self.norm_type(
                 self.n_heads * self.head_dim,
-                eps=model_params.norm_eps,
+                eps=model_params['norm_eps'],
             )
             if self.apply_qk_norm
             else nn.Identity()
@@ -89,27 +85,27 @@ class CustomAttn(nn.Module):
         return self.out_proj(output), past_key_value
 
 
-class TransformerBlock(FSDPBlock):
-    def __init__(self, layer_id: int, model_params: TransformerParams):
+class TransformerBlock(nn.Module):
+    def __init__(self, layer_id: int, model_params: dict[str, Any]):
         super().__init__()
-        self.n_heads = model_params.n_heads
-        self.hidden_dim = model_params.hidden_dim
+        self.n_heads = model_params['n_heads']
+        self.hidden_dim = model_params['hidden_dim']
 
-        self.head_dim = model_params.hidden_dim // model_params.n_heads
+        self.head_dim = model_params['hidden_dim'] // model_params['n_heads']
         self.attention = CustomAttn(layer_id, model_params)
-        self.ffn_type = model_params.ffn_type
+        self.ffn_type = model_params['ffn_type']
         self.feed_forward, self.ffn_hidden_dim = get_feed_forward(self.ffn_type, self.hidden_dim)
-        self.is_causal = model_params.is_causal
+        self.is_causal = model_params['is_causal']
 
         self.layer_id = layer_id
-        self.norm_type = get_norm_class(model_params.norm_type)
+        self.norm_type = torch.nn.LayerNorm
         self.attention_norm = self.norm_type(
-            model_params.hidden_dim,
-            eps=model_params.norm_eps,
+            model_params['hidden_dim'],
+            eps=model_params['norm_eps'],
         )
         self.ffn_norm = self.norm_type(
-            model_params.hidden_dim,
-            eps=model_params.norm_eps,
+            model_params['hidden_dim'],
+            eps=model_params['norm_eps'],
         )
         self.reset_parameters()
 
@@ -144,37 +140,38 @@ class TransformerBlock(FSDPBlock):
         return out, past_key_value
 
 
-class Transformer(TransformerBase):
-    def __init__(self, model_params: TransformerParams):
-        super().__init__(model_params)
+class Transformer(nn.Module):
+    def __init__(self, model_params : dict[str, Any]):
+        super().__init__()
+        self.model_params = model_params
         # for convenience we often share param names with llama
-        self._hidden_dim = model_params.hidden_dim
-        self.vocab_size = model_params.vocab_size
-        self.n_layers = model_params.n_layers
-        self.max_seq_len = model_params.max_seq_len
-        self.norm_type = get_norm_class(model_params.norm_type)
+        self._hidden_dim = model_params['hidden_dim']
+        self.vocab_size = model_params['vocab_size']
+        self.n_layers = model_params['n_layers']
+        self.max_seq_len = model_params['max_seq_len']
+        self.norm_type = torch.nn.LayerNorm
         self.post_embed_norm = (
             self.norm_type(
-                model_params.hidden_dim,
-                eps=model_params.norm_eps,
+                model_params['hidden_dim'],
+                eps=model_params['norm_eps'],
             )
-            if model_params.post_embed_norm
+            if model_params['post_embed_norm']
             else nn.Identity()
         )
-        self.weight_tying = model_params.weight_tying
-        self.embeddings = nn.Embedding(model_params.vocab_size, model_params.hidden_dim)
-        self.is_causal = model_params.is_causal
+        self.weight_tying = model_params['weight_tying']
+        self.embeddings = nn.Embedding(model_params['vocab_size'], model_params['hidden_dim'])
+        self.is_causal = model_params['is_causal']
 
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(model_params.n_layers):
+        for layer_id in range(model_params['n_layers']):
             self.layers.append(TransformerBlock(layer_id, model_params))
 
         # get class for normalization layers
         self.norm = self.norm_type(
-            model_params.hidden_dim,
-            eps=model_params.norm_eps,
+            model_params['hidden_dim'],
+            eps=model_params['norm_eps'],
         )
-        self.output = nn.Linear(model_params.hidden_dim, model_params.vocab_size, bias=False)
+        self.output = nn.Linear(model_params['hidden_dim'], model_params['vocab_size'], bias=False)
         if self.weight_tying:
             self.embeddings.weight = self.output.weight
         self.grad_checkpointing = False
@@ -200,7 +197,7 @@ class Transformer(TransformerBase):
     def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
 
-    def resize_token_embeddings(self, new_num_tokens: int = None) -> int:
+    def resize_token_embeddings(self, new_num_tokens: int | None = None) -> int:
         """Resize the token embedding table. Mirrors HF's `resize_token_embeddings` semantics:
         - `new_num_tokens is None` → query current size, no modification.
         - `new_num_tokens <= current` → no-op, returns current size.
@@ -293,14 +290,11 @@ class Transformer(TransformerBase):
             past_key_values = None
         x = self.norm(x)
         output = self.output(x)
-        if self.model_params.cast_output_to_float32:
+        if self.model_params['cast_output_to_float32']:
             output = output.float()
 
-        return TransformerOutput(
-            logits=output,
-            past_key_values=past_key_values,
-            hidden_states=tuple(hidden_states) if output_hidden_states else None,
-        )
+        output = tuple(hidden_states) if output_hidden_states else None
+        return output
 
     def generate(
         self,
@@ -391,6 +385,106 @@ class Transformer(TransformerBase):
         return generated
 
 
-@register_model("transformer")
-def create_transformer(model_params: TransformerParams, load_pretrained: bool = True):
-    return Transformer(model_params)
+def get_rectangular_causal_mask(shape, q_seq_len, k_seq_len, device, dtype):
+    """Create a rectangular causal mask.
+
+    This is especially useful when query length < key length, and ensures that the attention tensor comes from a tensor
+    that initially has dimensions that are a multiple of 8, as required by xformers.
+
+    >>> get_rectangular_causal_mask((1, 1), 2, 2, "cpu", torch.float32)
+    tensor([[[[0., -inf],
+              [0., 0.]]]])
+    >>> get_rectangular_causal_mask((1, 1), 3, 5, "cpu", torch.float32)
+    tensor([[[[0., 0., 0., -inf, -inf],
+              [0., 0., 0., 0., -inf],
+              [0., 0., 0., 0., 0.]]]])
+    >>> get_rectangular_causal_mask((1, 1), 5, 5, "cpu", torch.float32)
+    tensor([[[[0., -inf, -inf, -inf, -inf],
+              [0., 0., -inf, -inf, -inf],
+              [0., 0., 0., -inf, -inf],
+              [0., 0., 0., 0., -inf],
+              [0., 0., 0., 0., 0.]]]])
+    """
+    # xformers requires the mask to be built with a shape that is a multiple of 8
+    next_multiple_8 = (k_seq_len + 7) // 8 * 8  #
+
+    mask = torch.ones((q_seq_len, k_seq_len), device=device, dtype=bool)
+    mask[:, -q_seq_len:] = torch.tril(mask[:, -q_seq_len:], diagonal=0)
+
+    output_mask = torch.zeros((*shape, q_seq_len, next_multiple_8), device=device, dtype=dtype)
+    output_mask[:, :, :, :k_seq_len].masked_fill_(~mask, torch.finfo(dtype).min)
+    return output_mask[:, :, :, :k_seq_len]
+
+
+def apply_attention_mask_(bias, attention_mask, queries_dtype):
+    """Applies attention mask (e.g., from HuggingFace generate) to an attention bias mask in-place.
+
+    Args:
+        bias (torch.Tensor, shape (batch_size, num_heads, q_seq_len, k_seq_len))
+        attention_mask (torch.Tensor, shape (batch_size, sequence_len))
+        queries_dtype: queries.dtype; used to get minimum value for masked indices.
+
+    Returns:
+        bias_with_mask (torch.Tensor, shape (batch_size, num_heads, q_seq_len, k_seq_len))
+    """
+    # Update mask to remove attention based on attention_mask that's passed in.
+    assert attention_mask.dim() == 2
+    # From https://github.com/huggingface/transformers/blob/f738ab3b5d30e30c43a4c3d00ca8939f8a4d4427/src/transformers/models/llama/modeling_llama.py#L1089C1-L1091C117
+    mask_length = attention_mask.shape[-1]
+    # Set parts of bias that are zero (i.e., where attention is allowed) _and_ attention_mask is False (i.e.,
+    # where we should not attend) with min_dtype.
+    padding_mask = bias[..., :mask_length].eq(0.0) * attention_mask[:, None, None, :].eq(0.0)
+    min_dtype = torch.finfo(queries_dtype).min
+    bias[..., :mask_length] = bias[..., :mask_length].masked_fill(padding_mask, min_dtype)
+    # Disable masking for sequence indices where all attention weights are -inf
+    # We won't use these anyway, and keeping them as -inf leads to nans.
+    # See https://github.com/huggingface/transformers/blob/f738ab3b5d30e30c43a4c3d00ca8939f8a4d4427/src/transformers/modeling_attn_mask_utils.py#L189
+    # for details.
+    bias.mul_(~torch.all(bias == min_dtype, dim=-1, keepdim=True))
+
+
+def torch_attn(queries, keys, values, is_causal, attention_mask=None):
+    # Need to call contiguous in torch >=2.1, otherwise later calls to .view() fail.
+    # Possibly related: https://github.com/pytorch/pytorch/issues/110213 - behavior of scaled_dot_product_attention
+    # changed between 2.0 and 2.1
+    if is_causal and keys.shape[1] > queries.shape[1] > 1:
+        q_seq_len = queries.shape[1]
+        k_seq_len = keys.shape[1]
+        mask = get_rectangular_causal_mask((1, 1), q_seq_len, k_seq_len, queries.device, queries.dtype)
+        if attention_mask is not None:
+            apply_attention_mask_(mask, attention_mask, queries_dtype=queries.dtype)
+        return (
+            F.scaled_dot_product_attention(
+                queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2), attn_mask=mask
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )
+    else:
+        if attention_mask is None:
+            bias = None
+            # If we only have one query, assume we don't need to be in causal mode (can attend to all keys).
+            if queries.shape[1] == 1:
+                is_causal = False
+        else:
+            if not is_causal:
+                raise NotImplementedError("attention_mask with is_causal=False is not yet implemented.")
+            # Build causal mask that assumes queries are in the end of the sequence.
+            batch, q_seq_len, heads, _ = queries.shape
+            k_seq_len = keys.shape[1]
+            bias = get_rectangular_causal_mask((batch, heads), q_seq_len, k_seq_len, queries.device, queries.dtype)
+            if attention_mask is not None:
+                apply_attention_mask_(bias, attention_mask, queries_dtype=queries.dtype)
+            # We apply causal mask in attention instead of using is_causal=True.
+            is_causal = False
+        return (
+            F.scaled_dot_product_attention(
+                queries.transpose(1, 2),
+                keys.transpose(1, 2),
+                values.transpose(1, 2),
+                attn_mask=bias,
+                is_causal=is_causal,
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )

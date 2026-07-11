@@ -59,29 +59,6 @@ class TransformerParams(ModelParams):
     is_causal: bool = field(default=True)
 
 
-@register_model_params("transformer_hf")
-@dataclass(frozen=True)
-class TransformerHFParams(ModelParams):
-    hf_pretrained: str = field(default=None)
-    _hf_config = None
-
-    @property
-    def hidden_dim(self):
-        if self._hf_config is None:
-            from transformers import AutoConfig
-
-            object.__setattr__(self, "_hf_config", AutoConfig.from_pretrained(self.hf_pretrained))
-        return self._hf_config.hidden_size
-
-    @property
-    def vocab_size(self):
-        if self._hf_config is None:
-            from transformers import AutoConfig
-
-            object.__setattr__(self, "_hf_config", AutoConfig.from_pretrained(self.hf_pretrained))
-        return self._hf_config.vocab_size
-
-
 @register_model_params("vit")
 @dataclass(frozen=True)
 class ViTParams(ModelParams):
@@ -96,13 +73,6 @@ class ViTParams(ModelParams):
     n_layers: int = field(default=12)
     ln_eps: float = field(default=1e-6)
     cls_flag: bool = field(default=False)
-    projector_pixel_shuffle_factor: int = field(default=1)
-
-
-@register_model_params("vit_hf")
-@dataclass(frozen=True)
-class ViTHFParams(TransformerHFParams):
-    hidden_dim: int = field(default=768)
     projector_pixel_shuffle_factor: int = field(default=1)
 
 
@@ -160,12 +130,6 @@ class VLMParams(ModelParams):
                         object.__setattr__(self.transformer, "vocab_size", computed_vocab_size)
 
 
-@register_model_params("vlm_hf")
-@dataclass(frozen=True)
-class VLMHFParams(TransformerHFParams):
-    pass
-
-
 @register_model_params("unet")
 @dataclass(frozen=True)
 class UNetParams(ModelParams):
@@ -178,57 +142,11 @@ class UNetParams(ModelParams):
     time_mlp_float32: bool = field(default=False)
 
 
-@register_model_params("noise_scheduler")
-@dataclass(frozen=True)
-class NoiseSchedulerParams(ModelParams):
-    num_timesteps: int = field(default=1000)
-    beta_start: float = field(default=0.0001)
-    beta_end: float = field(default=0.02)
-    clamp_range: tuple[float, float] = field(default=(-1.5, 1.5))
-
-    def init_shared_attributes(self, cfg):
-        super().init_shared_attributes(cfg)
-        if hasattr(cfg.data, "normalization") and self.clamp_range is not None:
-            if not cfg.data.normalization.enabled:
-                logging.warning(
-                    "Normalization is disabled with clamping range enabled. "
-                    f"Make sure your data is within the clamping range. {self.clamp_range}"
-                )
-            elif not cfg.data.normalization.centered_norm and self.clamp_range[0] == -self.clamp_range[1]:
-                raise ValueError(
-                    f"Clamp range {self.clamp_range} is symetric but "
-                    f"normalization is not centered: {cfg.data.normalization.centered_norm}"
-                    f"Set data.normalization.centered_norm to True or use a different clamp range."
-                )
-
-
-@register_model_params("clip_hf")
-@dataclass(frozen=True)
-class CLIPHFParams(TransformerHFParams):
-    freeze_text_encoder: bool = field(default=False)
-    freeze_image_encoder: bool = field(default=False)
-
-
-@register_model_params("clip_openclip")
-@dataclass(frozen=True)
-class CLIP_OpenCLIPParams(ModelParams):
-    architecture: str = field(default=None)
-    pretrained_weights: str = field(default=None)
-    freeze_text_encoder: bool = field(default=False)
-    freeze_image_encoder: bool = field(default=False)
-
-
 @dataclass(frozen=True)
 class BackboneParams(ModelParams):
     """Marker base class for vision-language backbone configurations."""
 
     pass
-
-
-@register_model_params("clip_backbone")
-@dataclass(frozen=True)
-class CLIPBackboneParams(BackboneParams, CLIPHFParams):
-    disable_text: bool = field(default=False)
 
 
 @register_model_params("vlm_backbone")
@@ -251,28 +169,6 @@ class VLMFoundryBackboneParams(BackboneParams):
 @dataclass(frozen=True)
 class ViTBackboneParams(BackboneParams, ViTParams):
     pass
-
-
-@register_model_params("stable_diffusion")
-@dataclass(frozen=True)
-class StableDiffusionParams(ModelParams):
-    unet: UNetParams = field(default_factory=UNetParams)
-    noise_scheduler: NoiseSchedulerParams = field(default_factory=NoiseSchedulerParams)
-
-    use_diffusers_unet: bool = field(default=False)
-    use_diffusers_scheduler: bool = field(default=False)
-    use_flow_matching_scheduler: bool = field(default=False)
-
-    clip: CLIPHFParams = field(default_factory=CLIPHFParams)
-
-    # CFG params
-    do_classifier_free_guidance: bool = field(default=False)
-    guidance_scale: float = field(default=4.0)  # Standard CFG scale
-    dropout_percent: float = field(default=0.2)  # 20%% dropout for unconditional training
-
-    @property
-    def image_size(self):
-        return self.unet.image_size
 
 
 @register_model_params("diffusion_policy")

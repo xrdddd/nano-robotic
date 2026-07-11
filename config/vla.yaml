@@ -1,0 +1,5 @@
+proprioception_dim : 7
+action_dim : 7
+diffusion_step_conditioning : concat
+input_noise_std : 0.0
+num_action_head_repeats : 0
