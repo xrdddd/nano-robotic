@@ -31,7 +31,7 @@ from nano_robotic.data.dataloader import get_datastring_input, get_dataloader
 from nano_robotic.utils.optimizer import create_optimizer
 from nano_robotic.utils.lr_scheduler import lr_scheduler
 from nano_robotic.utils.loss_function import masked_mse_loss
-from nano_robotic.utils.utils import set_random_seed, summarize_datastrings, load_yaml, count_parameters, print0, world_info_from_env
+from nano_robotic.utils.utils import set_random_seed, load_yaml, count_parameters, print0, world_info_from_env
 from nano_robotic.batch_handlers import DiffusionPolicyBatchHandler
 
 def parse_args():
@@ -116,7 +116,7 @@ def main():
             )
         )
 
-        logging.info(f"Now training on: {summarize_datastrings(datastrings)}")
+        logging.info(f"Now training on: {datastrings}")
         logging.info(f"Samples: {samples_seen} / {cfg.total_train_samples}")
         logging.info(f"Samples in this checkpoint: {num_samples_per_dataset}")
 
@@ -149,7 +149,7 @@ def main():
 def train_one_checkpoint(
     model: nn.Module,
     dataloader,
-    loss: Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor],
+    loss_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor],
     checkpoint_num: int,
     step: int,
     optimizer: optim.Optimizer,
@@ -173,7 +173,7 @@ def train_one_checkpoint(
     Args:
         model: torch.nn.Module or a distributed-wrapped module.
         dataloader: dataloader object.
-        loss: Callable loss function mapping (logits, targets, mask) -> scalar loss.
+        loss_fn: Callable loss function mapping (logits, targets, mask) -> scalar loss.
         checkpoint_num: Index of the current checkpoint window (for logs).
         step: Current global training step **before** this window starts.
         optimizer: torch.optim.Optimizer instance.
@@ -261,7 +261,7 @@ def train_one_checkpoint(
                 outputs = model(**model_inputs_ii)
                 forward_total_time += time.time() - forward_start
 
-                local_loss = batch_handler.compute_loss(outputs, targets_ii, loss, cfg, mask=mask_ii)
+                local_loss = batch_handler.compute_loss(outputs, targets_ii, loss_fn, cfg, mask=mask_ii)
 
                 # Scale loss by microbatch size ratio
                 local_loss = local_loss * (model_inputs_ii["input_ids"].shape[0] / model_inputs["input_ids"].shape[0])
@@ -294,7 +294,7 @@ def train_one_checkpoint(
         batch_size = len(model_inputs["input_ids"])
         # update the loss meter with the global loss tensor every iteration,
         # so that the logging is of the avg of loss of the last cfg.log_every_n_steps iterations
-        loss = global_loss_tensor.item() #be carefull item() is a CPU-GPU sync point
+        global_loss_tensor = total_loss.detach().clone()
 
         # if (
         #     (i % cfg.log_every_n_steps == 0 and i > 0)
