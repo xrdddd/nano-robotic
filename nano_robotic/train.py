@@ -10,9 +10,9 @@ Notes
 delegated to subpackages (data, models, opt, train, etc.).
 """
 
-import logging
 import torch
 import argparse
+import os
 
 import itertools
 import logging
@@ -32,6 +32,7 @@ from nano_robotic.utils.optimizer import create_optimizer
 from nano_robotic.utils.lr_scheduler import lr_scheduler
 from nano_robotic.utils.loss_function import masked_mse_loss
 from nano_robotic.utils.utils import set_random_seed, load_yaml, count_parameters, print0, world_info_from_env
+from nano_robotic.utils.file_utils import save_checkpoint
 from nano_robotic.batch_handlers import DiffusionPolicyBatchHandler
 
 def parse_args():
@@ -116,9 +117,9 @@ def main():
             )
         )
 
-        logging.info(f"Now training on: {datastrings}")
-        logging.info(f"Samples: {samples_seen} / {cfg.total_train_samples}")
-        logging.info(f"Samples in this checkpoint: {num_samples_per_dataset}")
+        print0(f"Now training on: {datastrings}")
+        print0(f"Samples: {samples_seen} / {cfg.total_train_samples}")
+        print0(f"Samples in this checkpoint: {num_samples_per_dataset}")
 
         dataloader = get_dataloader(datastrings, num_samples_per_dataset, checkpoint_num, world_size, cfg)
 
@@ -142,8 +143,26 @@ def main():
         checkpoint_num += 1
         done_training = global_step >= total_steps
 
+        # Persist training state (model/opt/scheduler + data cursors).
+        checkpoint_path = "checkpoints"
+        os.makedirs(checkpoint_path, exist_ok=True)
+        save_checkpoint(
+            cfg,
+            checkpoint_num,
+            checkpoint_path,
+            cfg.max_checkpoint_limit,
+            model,
+            optimizer,
+            datastrings,
+            curr_shard_idx_per_dataset,
+            samples_seen,
+            global_step,
+            shard_shuffle_seed_per_dataset,
+            ema_model=None,
+        )
+
         if done_training:
-            logging.info("Model has seen the desired number of samples. Ending training.")
+            print0("Model has seen the desired number of samples. Ending training.")
             break
 
 def train_one_checkpoint(
@@ -312,11 +331,10 @@ def train_one_checkpoint(
                 # checkpoint_num=checkpoint_num,
             
 
+        loss_value = global_loss_tensor.item()
         # Update progress bar
         progress_bar.update(1)
-        progress_bar.set_postfix(
-            {"loss": f"{global_loss_tensor.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}"}
-        )
+        print0(f"steps:{step}/{total_steps}, loss:{loss_value:.4f}, lr:{optimizer.param_groups[0]['lr']:.6f}")
 
     progress_bar.close()
 
