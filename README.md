@@ -1,6 +1,6 @@
 
 # nano-robotic
-nano-robotic is a project aiming to train high efficient Vision-Language-Action model and deploy on edge robotic devices. It support the following:
+nano-robotic is a project aiming to train high efficient Vision-Language-Action model and deploy on edge robotic devices, and keep the project code as simple as possible which means no unnecessary code design. It support the following:
 - **Multiple modalities**: Train a model with text, image-captions, and robotics data without any external dependencies. 
 - **Multi-node training**: nano-robotic streams datasets with [WebDatasets](https://github.com/webdataset/webdataset). Multi-GPU training works well locally with `torchrun`, in the future on large clusters with AWS SageMaker (TODO)
 - **Hugging Face support**: Modules can either be loaded using the native PyTorch implementation, or loaded using pre-trained weights from Hugging Face. This allows users to develop on top of state-of-the-art model releases for LLMs, VLMs, CLIP models, etc. (TODO)
@@ -51,7 +51,6 @@ or
 We use lightweight evaluation utilities and gRPC policy server templates.
 
 ## Repo Structure and Implementation
-The sections below highlight several key design choices and functionalities of the repo.
 
 ### 1. Param
 We use [draccus](https://github.com/dlwh/draccus) for argument parsing.
