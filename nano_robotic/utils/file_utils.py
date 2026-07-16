@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import torch.nn as nn
 from contextlib import contextmanager
 from typing import Any
 
@@ -33,6 +34,9 @@ except ImportError:
     _parse_hf_path = None
     _resolve_hf_path = None
 
+
+MODEL_CKPT_PREFIX   = "checkpoint_"
+OPT_CKPT_PREFIX     = "optimizer_"
 
 def _pt_load_s3_cp(file_path, map_location=None):
     of = fsspec.open(file_path, "rb")
@@ -295,22 +299,17 @@ def load_dataset_manifest(path, shard_shuffle_seed=None):
 
     return out
 
-
 def save_checkpoint(
     checkpoint_num,
     checkpoint_path,
-    model,
-    optimizer,
+    model_state_dict,
+    optimizer_state_dict,
     datastrings,
     curr_shard_idx_per_dataset,
     samples_seen,
     global_step,
     shard_shuffle_seed_per_dataset,
 ):
-    # Use unwrapped model state dict to avoid module prefix
-    unwrapped_model = get_unwrapped_model(model)
-    model_state_dict = unwrapped_model.state_dict()
-
     checkpoint_dict = {
         "checkpoint_num": checkpoint_num,
         "state_dict": model_state_dict,
@@ -322,13 +321,12 @@ def save_checkpoint(
     }
     optimizer_dict = {
         "checkpoint_num": checkpoint_num,
-        "optimizer": optimizer.state_dict(),
+        "optimizer": optimizer_state_dict,
     }
 
-
     prefixes = {
-        "checkpoint_": checkpoint_dict,
-        "optimizer_": optimizer_dict,
+        MODEL_CKPT_PREFIX: checkpoint_dict,
+        OPT_CKPT_PREFIX: optimizer_dict,
     }
 
     for prefix in prefixes:
@@ -346,7 +344,7 @@ def save_checkpoint(
     #             print(f"Removed old checkpoint: {prefix}{oldest_checkpoint}.pt")
 
 
-def get_unwrapped_model(model):
+def get_unwrapped_model(model) ->nn.Module:
     """Get the unwrapped model from DDP wrapper and torchcompile if present, otherwise return the model itself."""
 
     # These wrappers can be applied in different orders:

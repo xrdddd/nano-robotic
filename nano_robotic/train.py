@@ -32,7 +32,7 @@ from nano_robotic.utils.optimizer import create_optimizer
 from nano_robotic.utils.lr_scheduler import lr_scheduler
 from nano_robotic.utils.loss_function import masked_mse_loss
 from nano_robotic.utils.utils import set_random_seed, load_yaml, count_parameters, print0, world_info_from_env
-from nano_robotic.utils.file_utils import save_checkpoint
+from nano_robotic.utils.file_utils import save_checkpoint, get_unwrapped_model
 from nano_robotic.batch_handlers import DiffusionPolicyBatchHandler
 
 def parse_args():
@@ -147,11 +147,14 @@ def main():
             # Persist training state (model/opt/scheduler + data cursors).
             checkpoint_path = "checkpoints"
             os.makedirs(checkpoint_path, exist_ok=True)
+                # Use unwrapped model state dict to avoid module prefix
+            model_state = get_unwrapped_model(model).state_dict()
+            optimizer_state = optimizer.state_dict()
             save_checkpoint(
                 checkpoint_num,
                 checkpoint_path,
-                model,
-                optimizer,
+                model_state,
+                optimizer_state,
                 datastrings,
                 curr_shard_idx_per_dataset,
                 samples_seen,
