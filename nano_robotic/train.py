@@ -143,23 +143,21 @@ def main():
         checkpoint_num += 1
         done_training = global_step >= total_steps
 
-        # Persist training state (model/opt/scheduler + data cursors).
-        checkpoint_path = "checkpoints"
-        os.makedirs(checkpoint_path, exist_ok=True)
-        save_checkpoint(
-            cfg,
-            checkpoint_num,
-            checkpoint_path,
-            cfg.max_checkpoint_limit,
-            model,
-            optimizer,
-            datastrings,
-            curr_shard_idx_per_dataset,
-            samples_seen,
-            global_step,
-            shard_shuffle_seed_per_dataset,
-            ema_model=None,
-        )
+        if 0 == global_rank:
+            # Persist training state (model/opt/scheduler + data cursors).
+            checkpoint_path = "checkpoints"
+            os.makedirs(checkpoint_path, exist_ok=True)
+            save_checkpoint(
+                checkpoint_num,
+                checkpoint_path,
+                model,
+                optimizer,
+                datastrings,
+                curr_shard_idx_per_dataset,
+                samples_seen,
+                global_step,
+                shard_shuffle_seed_per_dataset,
+            )
 
         if done_training:
             print0("Model has seen the desired number of samples. Ending training.")

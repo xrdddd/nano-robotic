@@ -297,10 +297,8 @@ def load_dataset_manifest(path, shard_shuffle_seed=None):
 
 
 def save_checkpoint(
-    cfg,
     checkpoint_num,
     checkpoint_path,
-    max_checkpoint_limit,
     model,
     optimizer,
     datastrings,
@@ -308,48 +306,10 @@ def save_checkpoint(
     samples_seen,
     global_step,
     shard_shuffle_seed_per_dataset,
-    ema_model=None,
 ):
-    if cfg.distributed.fsdp:
-        # FSDP get model state dict (load all params to CPU)
-        cpu_state = {}
-        for param_name, sharded_param in model.state_dict().items():
-            full_param = sharded_param.full_tensor() if isinstance(sharded_param, DTensor) else sharded_param
-            if cfg.distributed.rank == 0:
-                cpu_state[param_name] = full_param.cpu()
-            else:
-                del full_param
-
-        # FSDP get optimizer state dict
-        full_state = {}
-        for group_id, sharded_group in optimizer.state_dict()["state"].items():
-            group_state = {}
-            for param_name, sharded_param in sharded_group.items():
-                full_tensor = sharded_param.full_tensor() if isinstance(sharded_param, DTensor) else sharded_param
-                if cfg.distributed.rank == 0:
-                    group_state[param_name] = full_tensor.cpu()
-                else:
-                    del full_tensor
-            if cfg.distributed.rank == 0:
-                full_state[group_id] = group_state
-            else:
-                del group_state
-        optim_state = {
-            "param_groups": optimizer.state_dict()["param_groups"],
-            "state": full_state,
-        }
-
-    # Get model state dict and ensure consistent naming
-    if cfg.distributed.fsdp:
-        model_state_dict = cpu_state
-    else:
-        # Use unwrapped model state dict to avoid module prefix
-        unwrapped_model = get_unwrapped_model(model)
-        model_state_dict = unwrapped_model.state_dict()
-
-    # Only rank 0 should save and clean up to avoid race conditions in distributed training
-    if cfg.distributed.rank > 0:
-        return None
+    # Use unwrapped model state dict to avoid module prefix
+    unwrapped_model = get_unwrapped_model(model)
+    model_state_dict = unwrapped_model.state_dict()
 
     checkpoint_dict = {
         "checkpoint_num": checkpoint_num,
@@ -362,42 +322,28 @@ def save_checkpoint(
     }
     optimizer_dict = {
         "checkpoint_num": checkpoint_num,
-        "optimizer": optim_state if cfg.distributed.fsdp else optimizer.state_dict(),
+        "optimizer": optimizer.state_dict(),
     }
 
-    # Save EMA state if present
-    if ema_model is not None:
-        ema_dict = {
-            "checkpoint_num": checkpoint_num,
-            "ema_state_dict": ema_model.model.state_dict(),
-            "ema_optimization_step": ema_model.optimization_step.item()
-            if hasattr(ema_model, "optimization_step")
-            else 0,
-        }
-        prefixes = {
-            "checkpoint_": checkpoint_dict,
-            "optimizer_": optimizer_dict,
-            "ema_": ema_dict,
-        }
-    else:
-        prefixes = {
-            "checkpoint_": checkpoint_dict,
-            "optimizer_": optimizer_dict,
-        }
+
+    prefixes = {
+        "checkpoint_": checkpoint_dict,
+        "optimizer_": optimizer_dict,
+    }
 
     for prefix in prefixes:
         path = os.path.join(checkpoint_path, f"{prefix}{checkpoint_num}.pt")
         print(f"Saving {prefix}{checkpoint_num} in {path}...")
         torch.save(prefixes[prefix], path)
 
-    # Clean up old checkpoints if max_checkpoints is specified
-    if max_checkpoint_limit is not None and checkpoint_num >= max_checkpoint_limit:
-        oldest_checkpoint = checkpoint_num - max_checkpoint_limit
-        for prefix in prefixes:
-            old_path = os.path.join(checkpoint_path, f"{prefix}{oldest_checkpoint}.pt")
-            if os.path.exists(old_path):
-                os.remove(old_path)
-                print(f"Removed old checkpoint: {prefix}{oldest_checkpoint}.pt")
+    # # Clean up old checkpoints if max_checkpoints is specified
+    # if max_checkpoint_limit is not None and checkpoint_num >= max_checkpoint_limit:
+    #     oldest_checkpoint = checkpoint_num - max_checkpoint_limit
+    #     for prefix in prefixes:
+    #         old_path = os.path.join(checkpoint_path, f"{prefix}{oldest_checkpoint}.pt")
+    #         if os.path.exists(old_path):
+    #             os.remove(old_path)
+    #             print(f"Removed old checkpoint: {prefix}{oldest_checkpoint}.pt")
 
 
 def get_unwrapped_model(model):
